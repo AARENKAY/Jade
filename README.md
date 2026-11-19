@@ -138,18 +138,23 @@ Example replies:
 > **Good match**
 >
 > ## 🎬 SR075
+>
 > ✅ Good match  |  🎯 `92%`  |  around ⏱️ `~2:50`
 
 > **Weak match**
 >
 > ## ❗ No confident match
+>
 > **Best guess:** 🎬 SR075  |  🎯 `81%`  |  around ⏱️ `~2:50`
+>
 > ***This is only a guess and could be the wrong video!***
+>
 > **Reason:** Cropped/Edited, not Indexed, or not in the Archive.
 
 > **Nothing found**
 >
 > ## ❗ No match found
+>
 > **Reason:** Cropped/Edited, not Indexed, or not in the Archive.
 
 ### Archive lookups
