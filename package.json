@@ -1,0 +1,19 @@
+{
+  "name": "jade-indexer",
+  "version": "1.0.0",
+  "description": "Discord bot that finds which video a clip or screenshot came from, using perceptual fingerprints of videos on rclone remotes.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && python3 -m py_compile jadefp.py vindex.py vget.py"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.0"
+  },
+  "keywords": ["discord", "discord-bot", "video", "perceptual-hash", "rclone", "termux"],
+  "license": "MIT",
+  "private": false
+}
