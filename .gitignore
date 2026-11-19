@@ -1,0 +1,23 @@
+# Secrets: never commit these
+.bot-token
+.env
+.env.*
+
+# Dependencies
+node_modules/
+
+# Local data (the bot keeps its database and temp files in ~/Jade, outside the repo)
+*.db
+*.db-wal
+*.db-shm
+tmp/
+cache/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs and OS files
+*.log
+npm-debug.log*
+.DS_Store
