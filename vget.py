@@ -89,10 +89,14 @@ def _ffmpeg_clip(path, seconds, vf, size, pix_fmt='gray'):
 
 # Orientations tried (in this order) only when the clip as given finds nothing.
 # Each maps a 32x32 tile to what the tile would look like with the frame edited that way.
+# The 32x32 tile is the whole frame squashed to a square, so turning the tile equals turning the frame.
+# A clip that was rotated 90 degrees clockwise is undone by turning its tile 90 degrees counter-clockwise.
 ORIENTATIONS = (
     ('flipped left-right', lambda t: t[:, ::-1]),
     ('flipped upside-down', lambda t: t[::-1, :]),
     ('rotated 180 degrees', lambda t: t[::-1, ::-1]),
+    ('rotated 90 degrees clockwise', lambda t: np.rot90(t, 1)),
+    ('rotated 90 degrees counter-clockwise', lambda t: np.rot90(t, -1)),
 )
 
 
@@ -145,8 +149,8 @@ def extract_query(path, seconds):
     content (whole frame) or bars (trimmed). A second may therefore appear twice; the ranking keeps
     only the closest hash per second, so nothing is counted double.
 
-    `variants` = [(label, hashes)] for the same frames flipped left-right, flipped upside-down and
-    rotated 180 degrees. They are only searched when the normal search finds nothing (a flipped
+    `variants` = [(label, hashes)] for the same frames flipped left-right, flipped upside-down,
+    rotated 180 degrees and rotated 90 degrees either way. They are only searched when the normal search finds nothing (a flipped
     re-upload), so normal lookups cost the same."""
     raws = [_ffmpeg_clip(path, seconds, jadefp.VIDEO_FILTER, 32)]
     try:
@@ -232,7 +236,8 @@ def _hash_tile(tile, orient=None):
 
 def extract_image_hashes(path):
     """Hashes to try for a screenshot: the whole image, and the image with black bars trimmed, each
-    also as it would look flipped left-right, flipped upside-down and rotated 180 degrees.
+    also as it would look flipped left-right, flipped upside-down, rotated 180 degrees and rotated 90
+    degrees either way.
 
     Both crops are searched because dark edges may be real picture content (whole image) or
     letterbox bars from a player (trimmed). All orientations are searched at once: a single frame is
