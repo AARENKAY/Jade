@@ -232,7 +232,7 @@ Run `python vget.py --help` and read the top of `vindex.py` for every option.
 
 ## Limitations
 
-- Heavy edits (crops, zooms, filters, speed changes) and 90° rotations will not match.
+- Heavy edits (crops, zooms, filters, speed changes) will not match.
 - Clips shorter than 30 seconds, and portrait clips, are rejected.
 - A screenshot only matches if it is an identical frame to one the index holds (see above).
 - Same-name replacements are not re-indexed automatically (see Indexing notes).
