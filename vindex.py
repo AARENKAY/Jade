@@ -4,7 +4,7 @@
 Usage:
   vindex.py LOCAL_VIDEO REMOTE_PATH [--root REMOTE_ROOT]   index one downloaded video
   vindex.py status REMOTE_ROOT   < rclone-lsf-listing       plan: "<0|1>\\t<size>\\t<remote path>" (1 = already indexed)
-  vindex.py prune REMOTE_ROOT [--force] < rclone-lsf-listing  drop entries of this folder that no longer exist
+  vindex.py prune REMOTE_ROOT [--force] < rclone-lsf-listing  drop entries inside this folder that no longer exist
   vindex.py purge-crops                                     delete legacy crop fingerprints (crop_id>0) and shrink the file
   vindex.py forget-root REMOTE_ROOT                         drop every entry recorded for this folder
   vindex.py dbinfo                                          print a JSON summary of the database (used by /index-db)
@@ -553,7 +553,15 @@ def cmd_prune(root, force):
         return 1
     present = {video_key(path) for _, path in items}
     conn = open_db()
-    rows = conn.execute('SELECT id, video_key FROM videos WHERE root_key=?', (root_key(root),)).fetchall()
+    # Entries of this folder: those recorded under it, plus any whose stored path lies inside it, whatever
+    # folder they were recorded under (e.g. indexed earlier as part of a bulk run on a parent folder).
+    # The path test needs the '/' boundary so FF-239 never matches FF-2390.
+    base = normalize_remote(root)
+    inside = base if base.endswith(':') or base.endswith('/') else base + '/'
+    rows = conn.execute(
+        'SELECT id, video_key FROM videos WHERE root_key=? '
+        'OR (remote_path IS NOT NULL AND substr(remote_path, 1, ?) = ?)',
+        (root_key(root), len(inside), inside)).fetchall()
     stale = [vid for vid, key in rows if key not in present]
     if (not force and len(rows) >= 5 and len(stale) > PRUNE_GUARD_FRACTION * len(rows)):
         print(f'Refusing to prune {len(stale)} of {len(rows)} entries: that is more than '

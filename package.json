@@ -1,19 +1,27 @@
 {
-  "name": "jade-indexer",
+  "name": "jade",
   "version": "1.0.0",
-  "description": "Discord bot that finds which video a clip or screenshot came from, using perceptual fingerprints of videos on rclone remotes.",
+  "description": "Discord bot that fingerprints the videos in an rclone remote and finds which archived video a clip or screenshot came from.",
   "main": "index.js",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AARENKAY/Jade.git"
+  },
+  "homepage": "https://github.com/AARENKAY/Jade#readme",
+  "bugs": {
+    "url": "https://github.com/AARENKAY/Jade/issues"
+  },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && python3 -m py_compile jadefp.py vindex.py vget.py"
+    "check": "node --check index.js && python3 -m py_compile jadefp.py vget.py vindex.py && for f in *.sh; do bash -n \"$f\" || exit 1; done",
+    "test": "node tests/settings.test.js && node tests/spam.test.js && bash tests/e2e.sh"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
   "dependencies": {
-    "discord.js": "^14.22.0"
-  },
-  "keywords": ["discord", "discord-bot", "video", "perceptual-hash", "rclone", "termux"],
-  "license": "MIT",
-  "private": false
+    "discord.js": "^14.14.1"
+  }
 }

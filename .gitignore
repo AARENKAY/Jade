@@ -1,21 +1,23 @@
-# Secrets: never commit these
+# Secrets and your own configuration: never commit these
 .bot-token
 .env
-.env.*
+settings.py
 
 # Dependencies
 node_modules/
 
-# Local data (the bot keeps its database and temp files in ~/Jade, outside the repo)
-*.db
-*.db-wal
-*.db-shm
-tmp/
-cache/
-
 # Python
 __pycache__/
 *.pyc
+
+# The index database and temporary downloads normally live in ~/Jade, outside this folder.
+# These keep a stray copy out of the repo.
+*.db
+*.db-wal
+*.db-shm
+vindex-bulk-*
+remote-video-list.*
+remote-video-plan.*
 
 # Logs and OS files
 *.log

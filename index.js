@@ -1,7 +1,7 @@
 'use strict';
 
 // Jade local video indexer bot
-// Uses the normal Termux rclone config. No remote credentials are stored here.
+// Uses your normal rclone configuration (Termux or Linux). No remote credentials are stored here.
 
 const {
   Client,
@@ -38,11 +38,250 @@ function loadToken() {
 }
 
 const BOT_TOKEN = loadToken();
-// Server where the slash commands are registered (required): set JADE_GUILD_ID.
-const GUILD_ID = (process.env.JADE_GUILD_ID || '').trim();
-// Channel that receives short bot status messages (online/offline, job started/finished/failed,
-// errors). Not live progress. Set JADE_LOG_CHANNEL_ID to enable it; leave it unset to turn logging off.
-const LOG_CHANNEL_ID = (process.env.JADE_LOG_CHANNEL_ID || '').trim();
+
+// ------------------------------------------------------------------- settings
+// Every setting except the bot token lives in settings.py next to this script, as plain
+// NAME = value lines. Nothing is hardcoded here: without settings.py every text setting is blank
+// (off) and the bot refuses to start. The file is never executed: this reader accepts only "text"
+// and whole-number values. Change settings with /settings in Discord, or edit the file and run
+// /settings reload. (The token stays in .bot-token.)
+// SETTINGS-BEGIN
+const SETTINGS_FILE = path.join(__dirname, 'settings.py');
+const SETTINGS = {
+  GUILD_ID: { type: 'id', edit: false, restart: true,
+    desc: 'Server the slash commands are registered in (required)' },
+  LOG_CHANNEL_ID: { type: 'id',
+    desc: 'Channel for short status messages and alerts (blank = off)' },
+  CHANNEL_ID: { type: 'channels',
+    desc: 'Channel where the bot answers !get (threads count too). Several IDs: separate with commas. * = every channel, blank = off' },
+  REQUEST_CHANNEL_ID: { type: 'channels',
+    desc: 'Channel where the bot answers "anyone has CODE?" (threads count too). Several IDs: separate with commas. * = every channel, blank = off' },
+  ARCHIVE_CHANNEL_ID: { type: 'id',
+    desc: 'Channel where the videos are stored: the answer reads "CODE is in #channel" (blank = "is in the archive")' },
+  PREFIX_CHANNELS: { type: 'prefixes',
+    desc: 'Per-prefix channels for the "anyone has CODE?" answer, as PREFIX=channelID pairs, e.g. SR=123456789012345678,SL=234567890123456789. Other prefixes use ARCHIVE_CHANNEL_ID. Blank = off' },
+  ALLOWED_REMOTES: { type: 'remotes', edit: false,
+    desc: 'rclone remotes /index may read. Edit here only: a Manage Server member must not be able to point rclone at any other remote' },
+  COMMANDS_CHANNEL_ID: { type: 'id', edit: false,
+    desc: 'The only channel the slash commands work in (blank = any channel). Edit here only' },
+  SETTINGS_ROLE_ID: { type: 'id', edit: false,
+    desc: 'Role allowed to use /settings (blank = anyone with Manage Server). Edit here only' },
+  MAX_CLIP_MB: { type: 'int', min: 1, max: 1000, desc: 'Largest clip !get accepts (MB)' },
+  SEARCH_COOLDOWN_SECONDS: { type: 'int', min: 0, max: 3600, desc: 'Seconds a user waits between !get searches' },
+  STRIKE_LIMIT: { type: 'int', min: 0, max: 100, default: 5,
+    desc: 'Too-early or invalid !get messages (cooldown, busy, nothing to search) before a user is ignored for a while (0 = off)' },
+  STRIKE_MUTE_MINUTES: { type: 'int', min: 1, max: 1440, default: 10,
+    desc: 'How long a user who reached STRIKE_LIMIT is ignored (minutes)' },
+  BLOCKED_USER_IDS: { type: 'users',
+    desc: 'User IDs the bot ignores completely. Several IDs: separate with commas, blank = nobody' },
+  BLOCKED_ROLE_ID: { type: 'id',
+    desc: 'Members with this role are ignored completely by the bot (blank = off)' },
+  SEARCH_TIMEOUT_MINUTES: { type: 'int', min: 1, max: 60, desc: 'Give up on a !get search after this long' },
+  DOWNLOAD_TIMEOUT_MINUTES: { type: 'int', min: 1, max: 60, desc: 'Give up downloading the replied-to file after this long' },
+  GOOD_MATCH_PERCENT: { type: 'int', min: 1, max: 100, desc: 'Video clip match at or above this % is a good match, below it a guess' },
+  FULL_CREDIT_BITS: { type: 'int', min: 0, max: 63,
+    desc: 'Clip matching: a second whose frame is this many bits (of 64) or closer counts in full' },
+  ZERO_CREDIT_BITS: { type: 'int', min: 1, max: 64,
+    desc: 'Clip matching: a second this many bits or further away counts for nothing, partly in between. Must be above FULL_CREDIT_BITS' },
+  MIN_EVIDENCE_SECONDS: { type: 'int', min: 1, max: 30,
+    desc: 'Clip matching: a clip with fewer usable seconds than this cannot reach 100%' },
+  HAVE_COOLDOWN_SECONDS: { type: 'int', min: 0, max: 600, desc: 'Seconds between "anyone has CODE?" answers per user' },
+  MAX_CODES_PER_MESSAGE: { type: 'int', min: 1, max: 10, desc: 'Codes looked up per "anyone has" message' },
+  STALL_MINUTES: { type: 'int', min: 1, max: 120, desc: 'A running job with no progress for this long is reported as stalled' },
+  MAX_DOWNLOAD_FAILS: { type: 'int', min: 1, max: 100, desc: 'Stop a bulk run after this many downloads in a row fail' },
+  ALERT_GAP_MINUTES: { type: 'int', min: 1, max: 1440, desc: 'At most one error alert in the log channel per this many minutes' },
+  DEFAULT_THREADS: { type: 'int', min: 0, max: 256, desc: 'FFmpeg threads for /index jobs when none is given (0 = automatic)' },
+  MAX_THREADS: { type: 'int', min: 1, max: 256, restart: true, desc: 'Highest threads value /index accepts (Termux cannot detect cores)' },
+};
+const EDITABLE_SETTINGS = Object.keys(SETTINGS).filter(key => SETTINGS[key].edit !== false);
+const cfg = {};
+
+// The two clip-scoring distances only make sense together: full credit must come before zero credit.
+function scoringProblem(values) {
+  const { FULL_CREDIT_BITS: full, ZERO_CREDIT_BITS: zero } = values;
+  if (!Number.isInteger(full) || !Number.isInteger(zero)) return null;
+  return full < zero ? null : 'FULL_CREDIT_BITS must be lower than ZERO_CREDIT_BITS.';
+}
+
+// Returns { value } or { error }. Text settings accept "off" or "none" for blank.
+function checkSetting(key, raw) {
+  const def = SETTINGS[key];
+  if (def.type === 'int') {
+    const n = typeof raw === 'number' ? raw : (/^-?\d+$/.test(String(raw).trim()) ? Number(String(raw).trim()) : NaN);
+    if (!Number.isInteger(n)) return { error: 'Must be a whole number.' };
+    if (n < def.min || n > def.max) return { error: `Must be between ${def.min} and ${def.max}.` };
+    return { value: n };
+  }
+  if (typeof raw !== 'string') return { error: 'Must be text.' };
+  let text = raw.trim();
+  if (/^(off|none)$/i.test(text)) text = '';
+  const parts = text.split(',').map(item => item.trim()).filter(Boolean);
+  if (def.type === 'id') {
+    if (text && !/^\d{15,25}$/.test(text)) return { error: 'Must be a Discord ID (digits only) or blank.' };
+    return { value: text };
+  }
+  if (def.type === 'channels') {
+    if (parts.some(id => id !== '*' && !/^\d{15,25}$/.test(id))) return { error: 'Use comma-separated channel IDs, `*` for every channel, or `off`.' };
+    return { value: parts.join(',') };
+  }
+  if (def.type === 'users') {
+    if (parts.some(id => !/^\d{15,25}$/.test(id))) return { error: 'Use comma-separated user IDs (digits only), or `off`.' };
+    return { value: parts.join(',') };
+  }
+  if (def.type === 'prefixes') {
+    const pairs = parts.map(item => /^([A-Za-z]{1,10})\s*=\s*(\d{15,25})$/.exec(item));
+    if (pairs.some(pair => !pair)) return { error: 'Use PREFIX=channelID pairs separated by commas, e.g. `SR=123456789012345678,SL=234567890123456789`, or `off`.' };
+    return { value: pairs.map(pair => `${pair[1].toUpperCase()}=${pair[2]}`).join(',') };
+  }
+  if (def.type === 'remotes') {
+    if (parts.some(name => !/^[A-Za-z0-9_][A-Za-z0-9_. -]*$/.test(name))) return { error: 'Use comma-separated rclone remote names.' };
+    return { value: parts.join(',') };
+  }
+  return { error: 'Unknown setting type.' };
+}
+
+// Reads one literal at the start of text: "double" or 'single' quoted text (no backslashes), or a whole number.
+function parseLiteral(text) {
+  const quote = text[0];
+  if (quote === '"' || quote === "'") {
+    const close = text.indexOf(quote, 1);
+    if (close < 0) return null;
+    const body = text.slice(1, close);
+    if (body.includes('\\')) return null;
+    return { value: body, end: close + 1 };
+  }
+  const number = /^-?\d[\d_]*/.exec(text);
+  if (number) return { value: Number(number[0].replace(/_/g, '')), end: number[0].length };
+  return null;
+}
+
+function settingLiteral(value) {
+  return typeof value === 'number' ? String(value) : `"${value}"`;
+}
+
+// Fills cfg from settings.py. A text setting that is missing is blank (off). Whole-number settings
+// have no fallback: missing or invalid ones stay unset (null) until the file is fixed, and a reload
+// that finds a bad value keeps the one already in use. Returns warnings.
+let invalidSettings = new Set();
+function loadSettings() {
+  const warnings = [];
+  const found = {};
+  const unreadable = new Set();
+  let text = '';
+  try {
+    text = fsSync.readFileSync(SETTINGS_FILE, 'utf8');
+  } catch {
+    warnings.push('settings.py not found.');
+  }
+  // Earlier versions called these ARCHIVE_LINK_CHANNEL_ID and ARCHIVE_CHANNEL_IDS: keep their values.
+  const migrated = text
+    .replace(/^ARCHIVE_LINK_CHANNEL_ID(\s*=)/m, 'ARCHIVE_CHANNEL_ID$1')
+    .replace(/^ARCHIVE_CHANNEL_IDS(\s*=)/m, 'CHANNEL_ID$1');
+  if (migrated !== text) {
+    text = migrated;
+    try { fsSync.writeFileSync(SETTINGS_FILE, text); } catch { /* still applied in memory */ }
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^([A-Z][A-Z0-9_]*)\s*=\s*(.+)$/.exec(line);
+    if (!match) continue;
+    const literal = parseLiteral(match[2]);
+    if (!literal || !/^\s*(#.*)?$/.test(match[2].slice(literal.end))) {
+      warnings.push(`${match[1]}: could not read the value.`);
+      unreadable.add(match[1]);
+      continue;
+    }
+    found[match[1]] = literal.value;
+  }
+  const next = {};
+  const invalid = new Set();
+  for (const [key, def] of Object.entries(SETTINGS)) {
+    const isNumber = def.type === 'int';
+    const previous = cfg[key];
+    const inUse = previous !== undefined ? previous : (isNumber ? null : '');
+    if (key in found) {
+      const result = checkSetting(key, found[key]);
+      if (!result.error) { next[key] = result.value; continue; }
+      warnings.push(`${key}: ${result.error.replace(/`/g, '')}`);
+      invalid.add(key);
+      next[key] = inUse;
+    } else if (unreadable.has(key)) {
+      invalid.add(key);
+      next[key] = inUse;
+    } else if (isNumber && def.default !== undefined) {
+      next[key] = Number.isInteger(previous) ? previous : def.default;      // optional setting: older settings.py files lack it
+    } else if (isNumber) {
+      warnings.push(`${key}: missing from settings.py.`);
+      next[key] = Number.isInteger(previous) ? previous : null;
+    } else {
+      next[key] = '';
+    }
+  }
+  for (const key of Object.keys(found)) if (!SETTINGS[key]) warnings.push(`${key}: unknown setting (ignored).`);
+  const pairProblem = scoringProblem(next);
+  if (pairProblem) {
+    warnings.push(pairProblem);
+    invalid.add('FULL_CREDIT_BITS');
+    invalid.add('ZERO_CREDIT_BITS');
+  }
+  invalidSettings = invalid;
+  Object.assign(cfg, next);
+  return warnings;
+}
+
+// Reasons the bot cannot start (nothing is hardcoded to fall back on).
+function settingsBlockers() {
+  const blockers = [];
+  if (!fsSync.existsSync(SETTINGS_FILE)) return ['settings.py was not found next to index.js.'];
+  if (!cfg.GUILD_ID) blockers.push('GUILD_ID is blank.');
+  for (const [key, def] of Object.entries(SETTINGS)) {
+    if (def.type === 'int' && !Number.isInteger(cfg[key])) blockers.push(`${key} is missing or not a valid whole number.`);
+  }
+  for (const key of invalidSettings) if (!blockers.some(line => line.startsWith(key))) blockers.push(`${key} has an invalid value.`);
+  return blockers;
+}
+
+// Writes one validated value into settings.py (keeping the line's comment) and applies it now.
+function saveSetting(key, value) {
+  let text;
+  try { text = fsSync.readFileSync(SETTINGS_FILE, 'utf8'); } catch { text = ''; }
+  const lines = text.split('\n');
+  const literal = settingLiteral(value);
+  const pattern = new RegExp(`^${key}\\s*=\\s*(.+)$`);
+  let done = false;
+  for (let i = 0; i < lines.length && !done; i++) {
+    const match = pattern.exec(lines[i].replace(/\r$/, ''));
+    if (!match) continue;
+    const parsed = parseLiteral(match[1]);
+    lines[i] = `${key} = ${literal}${parsed ? match[1].slice(parsed.end) : ''}`;
+    done = true;
+  }
+  if (!done) {
+    if (lines[lines.length - 1] === '') lines.pop();
+    lines.push(`${key} = ${literal}`, '');
+  }
+  const temp = `${SETTINGS_FILE}.tmp`;
+  fsSync.writeFileSync(temp, lines.join('\n'));
+  fsSync.renameSync(temp, SETTINGS_FILE);
+  cfg[key] = value;
+}
+
+// Derived values, recomputed on every use so a /settings change applies immediately.
+const toSet = text => new Set(String(text).split(',').map(item => item.trim()).filter(Boolean));
+const L = {
+  get maxQueryBytes() { return cfg.MAX_CLIP_MB * 1024 * 1024; },
+  get searchCooldownMs() { return cfg.SEARCH_COOLDOWN_SECONDS * 1000; },
+  get searchTimeoutMs() { return cfg.SEARCH_TIMEOUT_MINUTES * 60 * 1000; },
+  get downloadTimeoutMs() { return cfg.DOWNLOAD_TIMEOUT_MINUTES * 60 * 1000; },
+  get haveCooldownMs() { return cfg.HAVE_COOLDOWN_SECONDS * 1000; },
+  get stallMs() { return cfg.STALL_MINUTES * 60 * 1000; },
+  get alertGapMs() { return cfg.ALERT_GAP_MINUTES * 60 * 1000; },
+  get getChannelIds() { return toSet(cfg.CHANNEL_ID); },
+  get requestChannelIds() { return toSet(cfg.REQUEST_CHANNEL_ID); },
+  get allowedRemotes() { return toSet(cfg.ALLOWED_REMOTES); },
+};
+
+for (const warning of loadSettings()) console.warn(`[settings] ${warning}`);
+// SETTINGS-END
 
 // ------------------------------------------------------------------- settings
 const INDEXER_PATH = path.join(__dirname, 'vindex.py');
@@ -57,30 +296,18 @@ const VIDEO_EXTS = new Set([
 ]);
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif']);
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024;      // largest screenshot accepted by !get
-const MAX_QUERY_BYTES = 150 * 1024 * 1024;     // largest clip accepted by !get
-const SEARCH_COOLDOWN_MS = 20 * 1000;          // per user
-const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
-// A match at or above this percentage is reported as a good match; anything below is called a guess.
-const GOOD_MATCH_PERCENT = 70;             // video clips: share of the clip's seconds that agree
-const GOOD_SCREENSHOT_PERCENT = 90;        // screenshots: one frame only, so a closer match is required
-const DOWNLOAD_TIMEOUT_MS = 2 * 60 * 1000;
+// !get only searches videos at least this long (0.5 s of slack: a clip trimmed to "30 s" is often 29.9 s).
+const MIN_CLIP_SECONDS = 30;
+// Screenshots (single frames) are unreliable, so !get only shows a screenshot result when the frame matches
+// this well (100 = an identical frame). Anything lower is reported as "No match found", never as a guess.
+const IMAGE_MIN_PERCENT = 100;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;     // largest screenshot !get accepts
 // Discord interaction tokens stop working after 15 minutes.
 const INTERACTION_TTL_MS = 14 * 60 * 1000;
 const KILL_GRACE_MS = 10 * 1000;
-// If a running job makes no real progress (no new bytes / seconds / files) for this long, the
-// Discord message says so and you get a DM + log-channel alert. JADE_STALL_MINUTES overrides it.
-const STALL_MS = Math.max(1, Number(process.env.JADE_STALL_MINUTES) || 5) * 60 * 1000;
 const STALL_CHECK_MS = 30 * 1000;
-// Stop a bulk run after this many downloads in a row fail (bad rclone config, expired login, no network).
-const MAX_CONSECUTIVE_DOWNLOAD_FAILS = 5;
-const ALERT_NOTIFY_GAP_MS = 10 * 60 * 1000;   // at most one error alert in the log channel per 10 min
 
 const NO_TOKEN = !BOT_TOKEN || BOT_TOKEN === 'BOT_TOKEN' || BOT_TOKEN === 'PASTE_YOUR_DISCORD_BOT_TOKEN_HERE';
-
-// os.cpus() is unreliable on Android/Termux (often reports 0-1 cores), so the cap is fixed.
-// Raise it with JADE_MAX_THREADS if your device has more than 16 cores.
-const MAX_THREADS_OPTION = Math.max(1, parseInt(process.env.JADE_MAX_THREADS || '16', 10) || 16);
 
 const COMMANDS = [
   new SlashCommandBuilder()
@@ -100,7 +327,7 @@ const COMMANDS = [
       .setName('threads')
       .setDescription('FFmpeg decoder threads for this job: 1 = coolest, higher = faster, 0 = automatic (all cores)')
       .setMinValue(0)
-      .setMaxValue(MAX_THREADS_OPTION)
+      .setMaxValue(cfg.MAX_THREADS)
       .setRequired(false))
     .addBooleanOption(option => option
       .setName('prune')
@@ -119,6 +346,17 @@ const COMMANDS = [
     .setName('index-cancel')
     .setDescription('Cancel the current indexing job')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('settings')
+    .setDescription('View or change the bot settings (stored in settings.py)')
+    .addSubcommand(sub => sub.setName('view').setDescription('Show every setting'))
+    .addSubcommand(sub => sub.setName('set').setDescription('Change one setting')
+      .addStringOption(option => option.setName('name').setDescription('Setting to change').setRequired(true)
+        .addChoices(...EDITABLE_SETTINGS.map(key => ({ name: key, value: key }))))
+      .addStringOption(option => option.setName('value').setDescription('New value (off = blank, * = every channel)')
+        .setRequired(true).setMaxLength(200)))
+    .addSubcommand(sub => sub.setName('reload').setDescription('Re-read settings.py after editing it by hand'))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),    // hidden from normal members; the role check below still applies
 ].map(command => command.toJSON());
 
 let client = null;
@@ -126,6 +364,59 @@ let activeJob = null;
 let activeSearch = null;
 let shuttingDown = false;
 const searchCooldown = new Map();
+
+// Spam protection. A "strike" is a !get that cannot be served: too early (cooldown), another search running,
+// or nothing to search. STRIKE_LIMIT strikes within STRIKE_WINDOW_MS and the user is told off once, then ignored
+// (no replies at all) for STRIKE_MUTE_MINUTES. Blocked users/roles are always ignored.
+const STRIKE_WINDOW_MS = 2 * 60 * 1000;
+const strikes = new Map();        // userId -> { count, first }
+const mutedUntil = new Map();     // userId -> time (ms) the mute ends
+
+function isIgnored(message) {
+  const id = message.author.id;
+  if (cfg.BLOCKED_USER_IDS && String(cfg.BLOCKED_USER_IDS).split(',').map(item => item.trim()).includes(id)) return true;
+  if (cfg.BLOCKED_ROLE_ID && message.member?.roles?.cache?.has(cfg.BLOCKED_ROLE_ID)) return true;
+  const until = mutedUntil.get(id);
+  if (until === undefined) return false;
+  if (Date.now() < until) return true;
+  mutedUntil.delete(id);
+  return false;
+}
+
+// Records a strike. Returns true when it starts a mute (the caller sends the one mute message).
+function addStrike(message) {
+  if (!cfg.STRIKE_LIMIT) return false;
+  const id = message.author.id;
+  const now = Date.now();
+  const entry = strikes.get(id);
+  if (!entry || now - entry.first > STRIKE_WINDOW_MS) strikes.set(id, { count: 1, first: now });
+  else entry.count += 1;
+  for (const [userId, item] of strikes) if (now - item.first > STRIKE_WINDOW_MS) strikes.delete(userId);   // keep the map small
+  if (strikes.get(id).count < cfg.STRIKE_LIMIT) return false;
+  strikes.delete(id);
+  mutedUntil.set(id, now + cfg.STRIKE_MUTE_MINUTES * 60 * 1000);
+  console.log(`[spam] Ignoring ${message.author.tag || id} (${id}) for ${cfg.STRIKE_MUTE_MINUTES} min.`);
+  logStatus(`🔇 Ignoring <@${id}> for ${cfg.STRIKE_MUTE_MINUTES} minutes (too many !get requests).`);
+  return true;
+}
+
+// What a user hears, once, when their last strike mutes them. After this the bot says nothing more until the mute ends.
+function muteMessage(minutes) {
+  const time = minutes === 1 ? '**1 minute**' : `**${minutes} minutes**`;
+  const lines = [
+    `Pipe down, will ya... 😒 You're bothering me. I won't be answering you for the next ${time}.`,
+    `Pipe down, will ya... 😒 You're bothering me. Not a word out of me for ${time}. Go touch some grass. 🌱`,
+    `Wow. Spamming me like I'm a vending machine. 🥤 I'm muting you for ${time}. Sit down and think about what you've done. 🪑`,
+    `That's it, I'm out. 🚪 Ignoring you for ${time}. Come back when you've learned patience. 🧘`,
+  ];
+  return lines[Math.floor(Math.random() * lines.length)];
+}
+
+// Replies to a !get that cannot be served. The strike that reaches the limit gets the mute message instead.
+function strikeReply(message, content, quiet) {
+  if (addStrike(message)) return message.reply({ content: muteMessage(cfg.STRIKE_MUTE_MINUTES), ...quiet });
+  return message.reply({ content, ...quiet });
+}
 // How long recent successful searches took, used to tell a waiting user roughly how long to wait.
 const searchDurations = [];
 const SEARCH_ESTIMATE_DEFAULT_MS = 30 * 1000;   // used until a search has finished since the bot started
@@ -137,15 +428,15 @@ let logQueue = Promise.resolve();
 let logErrorShown = false;
 
 function logStatus(text) {
-  if (!LOG_CHANNEL_ID || !client) return logQueue;
+  if (!cfg.LOG_CHANNEL_ID || !client) return logQueue;
   logQueue = logQueue.then(async () => {
     try {
-      const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+      const channel = await client.channels.fetch(cfg.LOG_CHANNEL_ID);
       await channel.send({ content: String(text).slice(0, 1900), allowedMentions: { parse: [] } });
     } catch (error) {
       if (!logErrorShown) {
         logErrorShown = true;
-        console.error(`Could not post to the log channel ${LOG_CHANNEL_ID}: ${error && error.message}`);
+        console.error(`Could not post to the log channel ${cfg.LOG_CHANNEL_ID}: ${error && error.message}`);
       }
     }
   });
@@ -174,10 +465,27 @@ function tail(text, max = 1600) {
   return text.length > max ? text.slice(-max) : text;
 }
 
-// rclone treats arguments starting with "-" as options, and control characters
-// have no place in a path.
+// Which remotes /index may read is the L.allowedRemotes setting (settings.py only, not /settings):
+// a Manage Server member must not be able to point rclone at any configured remote, a local path,
+// or an on-the-fly ":backend:" string.
+
+// Returns an error message, or null if the path is acceptable.
+function remoteProblem(value) {
+  if (typeof value !== 'string' || !value) return 'Empty path.';
+  if (value.startsWith('-')) return 'Invalid path (no leading "-").';
+  if (/[\u0000-\u001f\u007f]/.test(value)) return 'Invalid path (control characters).';
+  const colon = value.indexOf(':');
+  if (colon <= 0) return 'Use the form `remote:path/to/file` (local paths and ":backend:" strings are not allowed).';
+  const remote = value.slice(0, colon);
+  if (!/^[A-Za-z0-9_][A-Za-z0-9_. -]*$/.test(remote)) return 'Invalid remote name.';
+  if (L.allowedRemotes.size === 0) return 'No remotes are enabled. Set ALLOWED_REMOTES in settings.py.';
+  if (!L.allowedRemotes.has(remote)) return 'That remote is not enabled for indexing.';
+  if (value.slice(colon + 1).split(/[\\/]/).includes('..')) return 'Invalid path (no "..").';
+  return null;
+}
+
 function validRemote(value) {
-  return typeof value === 'string' && value.length > 0 && !value.startsWith('-') && !/[\u0000-\u001f]/.test(value);
+  return remoteProblem(value) === null;
 }
 
 // Children are spawned in their own process group so cancelling also stops
@@ -974,19 +1282,19 @@ function raiseAlert(job, text) {
     try { editJobReply(job, renderDiscord(job)); } catch { /* terminal output continues */ }
   }
   const now = Date.now();
-  if (now - (job.alertNotifiedAt || 0) >= ALERT_NOTIFY_GAP_MS) {
+  if (now - (job.alertNotifiedAt || 0) >= L.alertGapMs) {
     job.alertNotifiedAt = now;
     logStatus(`⚠️ Indexing error (still running): **${escapeMarkdown(shortName(job.filename))}**\n\`${text.slice(0, 500).replace(/`/g, "'")}\``);
   }
 }
 
-// Wakes every 30 s. If nothing has moved for STALL_MS, edits the Discord message to say so
+// Wakes every 30 s. If nothing has moved for L.stallMs, edits the Discord message to say so
 // (nothing else would, because no progress events arrive) and sends one DM + log message.
 function startWatchdog(job) {
   const timer = setInterval(() => {
     if (job.finished || job.cancelled || activeJob !== job) { clearInterval(timer); return; }
     const idle = Date.now() - job.lastProgressAt;
-    if (idle < STALL_MS) return;
+    if (idle < L.stallMs) return;
     job.stalledMinutes = Math.floor(idle / 60000);
     const first = !job.stalled;
     job.stalled = true;
@@ -1035,7 +1343,7 @@ function trackFailureStreak(job, ev) {
   if (ev.type === 'file_done') { job.failStreak = 0; return; }
   if (ev.type !== 'file_failed' || ev.stage !== 'download') return;
   job.failStreak = (job.failStreak || 0) + 1;
-  if (job.failStreak < MAX_CONSECUTIVE_DOWNLOAD_FAILS) return;
+  if (job.failStreak < cfg.MAX_DOWNLOAD_FAILS) return;
   job.abortReason = `Stopped after ${job.failStreak} downloads in a row failed. Last error: ${ev.error || 'unknown'}`;
   job.cancelled = true;
   job.cancelReason = job.abortReason;
@@ -1097,16 +1405,16 @@ function runProcess(command, args, job, options = {}) {
   });
 }
 
-// Child environment: structured progress on, Python unbuffered.
+// Child environment: structured progress on, Python unbuffered, FFmpeg thread count.
 function progressEnv(job) {
   const env = { ...process.env, JADE_EVENTS: '1', PYTHONUNBUFFERED: '1' };
-  if (job && Number.isInteger(job.threads)) env.JADE_FFMPEG_THREADS = String(job.threads);   // from /index threads:
+  env.JADE_FFMPEG_THREADS = String(job && Number.isInteger(job.threads) ? job.threads : cfg.DEFAULT_THREADS);   // /index threads: option, else the DEFAULT_THREADS setting
   return env;
 }
 
 // The thread setting a job really uses: the /index option, else the environment, else 1.
 function threadsLabel(job) {
-  const t = job && Number.isInteger(job.threads) ? job.threads : (process.env.JADE_FFMPEG_THREADS ?? '1');
+  const t = job && Number.isInteger(job.threads) ? job.threads : cfg.DEFAULT_THREADS;
   return String(t) === '0' ? 'auto' : String(t);
 }
 
@@ -1134,36 +1442,42 @@ async function removeTempDownload(tempFile) {
 const ARCHIVE_TRIGGER_RE = /\b(?:any|some)\s*(?:one|body)\s+(?:got|has|have|share)\b(.*)/i;
 // Codes in the rest of the message: 2+ letters, optional separator, 2+ digits (SL-341, sl341, SL 341).
 const ARCHIVE_CODE_RE = /\b[A-Za-z]{2,10}[\s_-]?\d{2,8}\b/g;
-const MAX_CODES_PER_MESSAGE = 3;
-const HAVE_COOLDOWN_MS = 5 * 1000;
 const haveCooldown = new Map();
-
-// Channels where this feature runs: comma-separated channel IDs (threads of a listed
-// channel count too). Leave JADE_ARCHIVE_CHANNEL_ID unset to run in every channel the bot can read.
-const ARCHIVE_CHANNEL_IDS = new Set(
-  (process.env.JADE_ARCHIVE_CHANNEL_ID || '')
-    .split(',').map(id => id.trim()).filter(Boolean));
-
-function archiveChannelAllowed(message) {
-  if (ARCHIVE_CHANNEL_IDS.size === 0) return true;
-  const channel = message.channel;
-  return ARCHIVE_CHANNEL_IDS.has(message.channelId) || (channel && channel.parentId && ARCHIVE_CHANNEL_IDS.has(channel.parentId));
+// Videos whose code starts with a prefix listed in PREFIX_CHANNELS (SR=123...,SL=456...) are answered with that
+// prefix's channel. Any other prefix falls back to ARCHIVE_CHANNEL_ID (or "the archive" when that is blank).
+function prefixChannel(prefix) {
+  for (const item of String(cfg.PREFIX_CHANNELS || '').split(',')) {
+    const [name, channelId] = item.split('=');
+    if (name && channelId && name.trim().toUpperCase() === prefix) return channelId.trim();
+  }
+  return '';
 }
 
+// !get runs in CHANNEL_ID and "anyone has CODE?" runs in REQUEST_CHANNEL_ID. Both reveal what is in
+// the archive, so blank turns them OFF; * means every channel the bot can read.
+function channelInList(message, ids) {
+  if (ids.size === 0) return false;
+  if (ids.has('*')) return true;
+  const channel = message.channel;
+  return ids.has(message.channelId) || Boolean(channel && channel.parentId && ids.has(channel.parentId));
+}
+const getChannelAllowed = message => channelInList(message, L.getChannelIds);
+const requestChannelAllowed = message => channelInList(message, L.requestChannelIds);
+
 function archiveQuery(message) {
-  if (!archiveChannelAllowed(message)) return [];
+  if (!requestChannelAllowed(message)) return [];
   const m = ARCHIVE_TRIGGER_RE.exec(message.content);
   if (!m) return [];
   const found = m[1].match(ARCHIVE_CODE_RE) || [];
-  return [...new Set(found.map(code => code.trim()))].slice(0, MAX_CODES_PER_MESSAGE);
+  return [...new Set(found.map(code => code.trim()))].slice(0, cfg.MAX_CODES_PER_MESSAGE);
 }
 
 async function answerArchiveQuestion(message, codes) {
   const quiet = { allowedMentions: { parse: [], repliedUser: false } };
   const now = Date.now();
-  if (now - (haveCooldown.get(message.author.id) || 0) < HAVE_COOLDOWN_MS) return;
+  if (now - (haveCooldown.get(message.author.id) || 0) < L.haveCooldownMs) return;
   haveCooldown.set(message.author.id, now);
-  for (const [userId, time] of haveCooldown) if (now - time > HAVE_COOLDOWN_MS * 6) haveCooldown.delete(userId);
+  for (const [userId, time] of haveCooldown) if (now - time > L.haveCooldownMs * 6) haveCooldown.delete(userId);
   if (!fsSync.existsSync(MATCHER_PATH) || !fsSync.existsSync(DB_PATH)) return;
 
   const job = { cancelled: false, cancelReason: 'Cancelled.', child: null };
@@ -1175,7 +1489,13 @@ async function answerArchiveQuestion(message, codes) {
       if (result.stdout.trim()) inArchive.push(code.toUpperCase());
     }
     if (inArchive.length) {
-      const lines = inArchive.map(code => `✅ **${escapeMarkdown(code)}** is in the archive.`);
+      const defaultWhere = cfg.ARCHIVE_CHANNEL_ID ? `<#${cfg.ARCHIVE_CHANNEL_ID}>` : 'the archive';
+      const lines = inArchive.map(code => {
+        const prefix = (/^[A-Z]+/.exec(code) || [''])[0];
+        const channelId = prefixChannel(prefix);
+        const where = channelId ? `<#${channelId}>` : defaultWhere;
+        return `✅ **${escapeMarkdown(code)}** is in ${where}`;
+      });
       await message.reply({ content: lines.join('\n'), ...quiet });
     }
     // Nothing found: stay silent, the question may be for other members.
@@ -1256,9 +1576,9 @@ async function openHandoff(job, body) {
   } catch (dmError) {
     // Discord answers "Cannot send messages to this user" (50007) whenever the user's privacy
     // settings block DMs from this server, even though the bot and user share a server.
-    if (LOG_CHANNEL_ID && client) {
+    if (cfg.LOG_CHANNEL_ID && client) {
       try {
-        const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+        const channel = await client.channels.fetch(cfg.LOG_CHANNEL_ID);
         const message = await channel.send(options);
         job.handoffWhere = 'log channel';
         termLog(`[Jade] Could not DM the progress (${dmError && dmError.message}); posting it in the log channel instead.`, 'stderr');
@@ -1385,8 +1705,9 @@ async function startIndex(interaction, remotePath, threads = null) {
   if (!remotePath || remotePath.endsWith('/') || !filename) {
     return interaction.reply({ content: '⚠️ Give the full path to one video file.', flags: MessageFlags.Ephemeral });
   }
-  if (!validRemote(remotePath)) {
-    return interaction.reply({ content: '⚠️ Invalid path (no leading "-" or control characters).', flags: MessageFlags.Ephemeral });
+  const pathProblem = remoteProblem(remotePath);
+  if (pathProblem) {
+    return interaction.reply({ content: `⚠️ ${pathProblem}`, flags: MessageFlags.Ephemeral });
   }
   if (!VIDEO_EXTS.has(ext)) {
     return interaction.reply({ content: `⚠️ Unsupported extension: ${ext || '(none)'}`, flags: MessageFlags.Ephemeral });
@@ -1423,7 +1744,7 @@ async function startIndex(interaction, remotePath, threads = null) {
     logStatus(`📥 Indexing started: **${escapeMarkdown(shortName(filename))}** (by ${who(interaction)})`);
     reportEvent(job, { type: 'download_start', index: 1, total: 1, name: filename, path: remotePath });
 
-    await runProcess('rclone', ['copyto', remotePath, tempFile, ...RCLONE_PROGRESS_ARGS], job, { onLine });
+    await runProcess('rclone', ['copyto', ...RCLONE_PROGRESS_ARGS, '--', remotePath, tempFile], job, { onLine });
 
     const stat = await fs.stat(tempFile);
     if (!stat.isFile() || stat.size <= 0) throw new Error('rclone completed but the downloaded file is empty.');
@@ -1473,8 +1794,9 @@ function folderSummaryText(job, extra, withFailures = false) {
 
 async function startFolderIndex(interaction, folderPath, prune, threads = null) {
   const remoteFolder = (folderPath || '').trim().replace(/\/+$/, '');
-  if (!remoteFolder || !validRemote(remoteFolder)) {
-    return interaction.reply({ content: '⚠️ Invalid folder path.', flags: MessageFlags.Ephemeral });
+  const folderProblem = remoteProblem(remoteFolder);
+  if (folderProblem) {
+    return interaction.reply({ content: `⚠️ ${folderProblem}`, flags: MessageFlags.Ephemeral });
   }
   if (!fsSync.existsSync(BULK_INDEXER_PATH)) {
     return interaction.reply({ content: '❌ `vindex-folder.sh` is missing.', flags: MessageFlags.Ephemeral });
@@ -1582,7 +1904,7 @@ function searchWaitSeconds(job) {
     ? searchDurations.reduce((a, b) => a + b, 0) / searchDurations.length
     : SEARCH_ESTIMATE_DEFAULT_MS;
   const elapsed = Date.now() - job.startedAt;
-  const remaining = Math.min(Math.max(avg - elapsed, 5000), Math.max(SEARCH_TIMEOUT_MS - elapsed, 5000));
+  const remaining = Math.min(Math.max(avg - elapsed, 5000), Math.max(L.searchTimeoutMs - elapsed, 5000));
   return Math.ceil(remaining / 5000) * 5;       // rounded up to 5 s
 }
 
@@ -1590,10 +1912,8 @@ async function searchRepliedVideo(commandMessage) {
   const quiet = { allowedMentions: { repliedUser: false } };
   if (activeSearch) {
     const wait = formatEta(searchWaitSeconds(activeSearch));
-    return commandMessage.reply({
-      content: `⏳ Another search is still running. Please wait for it to finish (about **${wait}**), then reply with \`!get\` again.`,
-      ...quiet,
-    });
+    return strikeReply(commandMessage,
+      `⏳ Another search is still running. Please wait for it to finish (about **${wait}**), then reply with \`!get\` again.`, quiet);
   }
   // Claim the single search slot before the first await so two quick "!get"
   // messages cannot both pass the check above.
@@ -1610,9 +1930,34 @@ async function searchRepliedVideo(commandMessage) {
   }
 }
 
+// Reads what !get needs to know about the query video: whether it is portrait as displayed, and how long
+// it is. ffprobe's width/height are the stored size, so phone videos saved sideways with a rotation flag
+// are swapped. Anything that cannot be read comes back as "not portrait / unknown length", and the matcher
+// then reports its own error.
+async function probeVideo(file, job) {
+  const unknown = { portrait: false, duration: null };
+  const result = await runProcess('ffprobe', [
+    '-v', 'error', '-protocol_whitelist', 'file,pipe', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height:stream_side_data=rotation:stream_tags=rotate:format=duration',
+    '-of', 'json', file,
+  ], job, { onLine: () => {} });
+  try {
+    const data = JSON.parse(result.stdout);
+    const stream = data.streams?.[0];
+    if (!stream) return unknown;
+    let { width, height } = stream;
+    const rotation = Number(stream.side_data_list?.find(item => item.rotation !== undefined)?.rotation ?? stream.tags?.rotate ?? 0);
+    if (Math.abs(rotation) % 180 === 90) [width, height] = [height, width];
+    const duration = Number(data.format?.duration);
+    return { portrait: height > width, duration: Number.isFinite(duration) && duration > 0 ? duration : null };
+  } catch {
+    return unknown;
+  }
+}
+
 async function runSearch(commandMessage, job, quiet) {
   if (!commandMessage.reference?.messageId) {
-    return commandMessage.reply({ content: '↩️ Reply to a video or screenshot with `!get`.', ...quiet });
+    return strikeReply(commandMessage, '↩️ Reply to a video or screenshot with `!get`.', quiet);
   }
 
   let sourceMessage;
@@ -1630,13 +1975,13 @@ async function runSearch(commandMessage, job, quiet) {
   const isImage = !video;
   if (isImage) video = attachments.find(item => IMAGE_EXTS.has(extOf(item)) || typeOf(item).startsWith('image/'));
   if (!video) {
-    return commandMessage.reply({ content: '⚠️ No video or image found in that message.', ...quiet });
+    return strikeReply(commandMessage, '⚠️ No video or image found in that message.', quiet);
   }
-  const sizeLimit = isImage ? MAX_IMAGE_BYTES : MAX_QUERY_BYTES;
+  const sizeLimit = isImage ? MAX_IMAGE_BYTES : L.maxQueryBytes;
   if (video.size > sizeLimit) {
-    return commandMessage.reply({ content: isImage
+    return strikeReply(commandMessage, isImage
       ? `⚠️ Image too large (max ${Math.round(MAX_IMAGE_BYTES / 1048576)} MB).`
-      : `⚠️ Video too large (max ${Math.round(MAX_QUERY_BYTES / 1048576)} MB). Use a shorter clip.`, ...quiet });
+      : `⚠️ Video too large (max ${Math.round(L.maxQueryBytes / 1048576)} MB). Use a shorter clip.`, quiet);
   }
   if (!fsSync.existsSync(MATCHER_PATH)) {
     return commandMessage.reply({ content: '❌ `vget.py` is missing.', ...quiet });
@@ -1644,13 +1989,13 @@ async function runSearch(commandMessage, job, quiet) {
 
   const now = Date.now();
   const last = searchCooldown.get(commandMessage.author.id) || 0;
-  if (now - last < SEARCH_COOLDOWN_MS) {
-    const wait = Math.ceil((SEARCH_COOLDOWN_MS - (now - last)) / 1000);
-    return commandMessage.reply({ content: `⏳ Wait ${wait}s before searching again.`, ...quiet });
+  if (now - last < L.searchCooldownMs) {
+    const wait = Math.ceil((L.searchCooldownMs - (now - last)) / 1000);
+    return strikeReply(commandMessage, `⏳ Wait ${wait}s before searching again.`, quiet);
   }
   searchCooldown.set(commandMessage.author.id, now);
   for (const [userId, time] of searchCooldown) {
-    if (now - time > SEARCH_COOLDOWN_MS * 3) searchCooldown.delete(userId);
+    if (now - time > L.searchCooldownMs * 3) searchCooldown.delete(userId);
   }
 
   const knownExts = isImage ? IMAGE_EXTS : VIDEO_EXTS;
@@ -1662,7 +2007,7 @@ async function runSearch(commandMessage, job, quiet) {
     job.cancelled = true;
     job.cancelReason = 'The search timed out.';
     stopChild(job);
-  }, SEARCH_TIMEOUT_MS);
+  }, L.searchTimeoutMs);
 
   try {
     statusMessage = await commandMessage.reply({
@@ -1671,7 +2016,7 @@ async function runSearch(commandMessage, job, quiet) {
     });
     await fs.mkdir(TEMP_DIR, { recursive: true, mode: 0o700 });
 
-    const response = await fetch(video.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    const response = await fetch(video.url, { signal: AbortSignal.timeout(L.downloadTimeoutMs) });
     if (!response.ok || !response.body) {
       throw new Error(`Could not download the attached video (HTTP ${response.status}).`);
     }
@@ -1688,16 +2033,30 @@ async function runSearch(commandMessage, job, quiet) {
     const stat = await fs.stat(tempFile);
     if (!stat.size) throw new Error('The uploaded video was empty.');
 
+    const probe = isImage ? { portrait: false, duration: null } : await probeVideo(tempFile, job);
+    const rejection = probe.portrait
+      ? '⚠️ Portrait videos are not supported. Reply to a landscape video.'
+      : (probe.duration !== null && probe.duration < MIN_CLIP_SECONDS - 0.5)
+        ? `⚠️ Videos shorter than ${MIN_CLIP_SECONDS} seconds are not supported. Reply to a video that is at least ${MIN_CLIP_SECONDS} seconds long.`
+        : null;
+    if (rejection) {
+      // The cooldown is kept: the file was already downloaded, and refunding it would let someone
+      // re-send rejected clips and make the bot download them again and again.
+      await statusMessage.edit({ content: rejection });
+      return;
+    }
+
     const matcherArgs = [MATCHER_PATH, tempFile, '--quiet', '--timestamps', ...(isImage ? ['--image'] : [])];
     const result = await runProcess('python', matcherArgs, job);
     const matches = result.stdout.split(/\r?\n/)
       .map(line => line.trim())
       .filter(Boolean)
+      .filter(line => !isImage || Number(line.split('\t')[2]) >= IMAGE_MIN_PERCENT)   // screenshots: identical frame or nothing
       .slice(0, 1)                         // best match only (the matcher lists results best-first)
       .map(line => {
         const [filename, seconds, percent] = line.split('\t');
         const name = escapeMarkdown(path.parse(filename).name);
-        const good = Number(percent) >= (isImage ? GOOD_SCREENSHOT_PERCENT : GOOD_MATCH_PERCENT);
+        const good = isImage || Number(percent) >= cfg.GOOD_MATCH_PERCENT;   // a screenshot only gets here if it met IMAGE_MIN_PERCENT
         top = { name, seconds: seconds === undefined ? null : Number(seconds), percent, good };
         const where = seconds === undefined ? '' : `  |  around ⏱️ \`~${formatTimestamp(Number(seconds))}\``;
         if (!good) return noMatchText(`🎬 ${name}  |  🎯 \`${percent}%\`${where}`);   // weak match
@@ -1730,12 +2089,81 @@ async function runSearch(commandMessage, job, quiet) {
   }
 }
 
+// ------------------------------------------------------------- access rules
+// Slash commands only work in COMMANDS_CHANNEL_ID (a thread of it counts). /settings additionally
+// needs the SETTINGS_ROLE_ID role; the other commands need Manage Server. !get is not a slash
+// command, so it follows CHANNEL_ID instead.
+function commandChannelProblem(interaction) {
+  const id = cfg.COMMANDS_CHANNEL_ID;
+  if (!id) return null;
+  const channel = interaction.channel;
+  if (interaction.channelId === id || (channel && channel.parentId === id)) return null;
+  return `🔒 Slash commands only work in <#${id}>.`;
+}
+
+function memberHasRole(interaction, roleId) {
+  const roles = interaction.member && interaction.member.roles;
+  if (!roles) return false;
+  if (Array.isArray(roles)) return roles.includes(roleId);      // uncached member: raw role ID list
+  return Boolean(roles.cache && roles.cache.has(roleId));
+}
+
+function commandPermissionProblem(interaction) {
+  if (interaction.commandName === 'settings' && cfg.SETTINGS_ROLE_ID) {
+    return memberHasRole(interaction, cfg.SETTINGS_ROLE_ID) ? null : `🔒 /settings is only for members with the <@&${cfg.SETTINGS_ROLE_ID}> role.`;
+  }
+  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ? null : '🔒 You need the Manage Server permission.';
+}
+
+// ---------------------------------------------------------------- /settings
+async function handleSettings(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const ephemeral = MessageFlags.Ephemeral;
+
+  if (sub === 'view') {
+    const lines = Object.keys(SETTINGS).map(key => `${SETTINGS[key].edit === false ? '🔒' : '  '} ${key} = ${JSON.stringify(cfg[key])}`);
+    return interaction.reply({
+      content: `⚙️ **Settings**  (🔒 = change in settings.py only)\n\`\`\`\n${lines.join('\n')}\n\`\`\``.slice(0, 1990),
+      flags: ephemeral,
+    });
+  }
+
+  if (sub === 'reload') {
+    const warnings = loadSettings();
+    logStatus(`⚙️ Settings reloaded by ${who(interaction)}`);
+    return interaction.reply({
+      content: warnings.length ? `⚠️ Reloaded with problems:\n${warnings.map(w => `• ${w}`).join('\n')}`.slice(0, 1900) : '✅ Reloaded settings.py.',
+      flags: ephemeral,
+    });
+  }
+
+  const key = interaction.options.getString('name', true);
+  if (!EDITABLE_SETTINGS.includes(key)) {
+    return interaction.reply({ content: '🔒 That setting can only be changed by editing settings.py.', flags: ephemeral });
+  }
+  const result = checkSetting(key, interaction.options.getString('value', true));
+  if (result.error) return interaction.reply({ content: `⚠️ ${key}: ${result.error}`, flags: ephemeral });
+  const pairProblem = scoringProblem({ ...cfg, [key]: result.value });
+  if (pairProblem) return interaction.reply({ content: `⚠️ ${key}: ${pairProblem}`, flags: ephemeral });
+  const old = cfg[key];
+  try {
+    saveSetting(key, result.value);
+  } catch (error) {
+    return interaction.reply({ content: `❌ Could not write settings.py: ${String(error.message).slice(0, 200)}`, flags: ephemeral });
+  }
+  logStatus(`⚙️ **${key}** changed ${JSON.stringify(old)} → ${JSON.stringify(result.value)} by ${who(interaction)}`);
+  return interaction.reply({
+    content: `✅ \`${key}\` = \`${JSON.stringify(result.value)}\` ${SETTINGS[key].restart ? '(saved; takes effect after a bot restart)' : '(applied now)'}`,
+    flags: ephemeral,
+  });
+}
+
 // ------------------------------------------------------------ discord plumbing
 async function registerCommands() {
-  if (GUILD_ID) {
-    const guild = await client.guilds.fetch(GUILD_ID);
+  if (cfg.GUILD_ID) {
+    const guild = await client.guilds.fetch(cfg.GUILD_ID);
     await guild.commands.set(COMMANDS);
-    console.log(`Registered ${COMMANDS.length} guild slash commands in ${GUILD_ID}.`);
+    console.log(`Registered ${COMMANDS.length} guild slash commands in ${cfg.GUILD_ID}.`);
   } else {
     await client.application.commands.set(COMMANDS);
     console.log(`Registered ${COMMANDS.length} global slash commands.`);
@@ -1760,27 +2188,35 @@ function attachHandlers() {
     logStatus(`🟢 Jade online${commandsOk ? '' : ' (slash commands not registered)'}`);
     console.log(`Database: ${DB_PATH}`);
     console.log('rclone will use its standard Termux configuration.');
-    console.log(ARCHIVE_CHANNEL_IDS.size ? `Archive check runs only in channel(s): ${[...ARCHIVE_CHANNEL_IDS].join(', ')}` : 'Archive check runs in every channel.');
+    const describeChannels = ids => ids.size ? (ids.has('*') ? 'every channel' : `channel(s) ${[...ids].join(', ')}`) : 'OFF (no channel configured)';
+    console.log(`!get runs in: ${describeChannels(L.getChannelIds)}`);
+    console.log(`"anyone has CODE?" runs in: ${describeChannels(L.requestChannelIds)}`);
+    console.log(L.allowedRemotes.size ? `/index may read remote(s): ${[...L.allowedRemotes].join(', ')}` : '/index is OFF until ALLOWED_REMOTES is set in settings.py.');
   });
 
   client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
+    if (isIgnored(message)) return;                  // blocked or temporarily muted: no reply, no work
     const codes = archiveQuery(message);
     if (codes.length) return answerArchiveQuestion(message, codes);
     const command = message.content.trim().toLowerCase();
     // This is intentionally a reply-based text trigger, not a slash interaction:
     // Discord chat-input slash commands do not expose the replied-to message.
     if (command !== '!get' && command !== '!get code') return;
+    if (!getChannelAllowed(message)) return;
     await searchRepliedVideo(message);               // "!get" and "!get code" both show the match % and moment
   });
 
   client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.reply({ content: '🔒 You need the Manage Server permission.', flags: MessageFlags.Ephemeral });
+    const accessProblem = commandChannelProblem(interaction) || commandPermissionProblem(interaction);
+    if (accessProblem) {
+      return interaction.reply({ content: accessProblem, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
     }
 
     try {
+      if (interaction.commandName === 'settings') return await handleSettings(interaction);
+
       if (interaction.commandName === 'index') {
         const remotePath = interaction.options.getString('file_path')?.trim() || '';
         const folderPath = interaction.options.getString('folder_path')?.trim() || '';
@@ -1939,8 +2375,9 @@ function main() {
     console.error('No Discord bot token found. Set JADE_BOT_TOKEN, or put the token in a file named .bot-token next to index.js.');
     process.exit(1);
   }
-  if (!GUILD_ID) {
-    console.error('No Discord server ID. Set the JADE_GUILD_ID environment variable to your server ID.');
+  const blockers = settingsBlockers();
+  if (blockers.length) {
+    console.error(`Cannot start: settings.py is not complete.\n${blockers.map(line => `  - ${line}`).join('\n')}\nNothing is built into index.js: put every setting in settings.py next to it.`);
     process.exit(1);
   }
   client = new Client({ intents: [
